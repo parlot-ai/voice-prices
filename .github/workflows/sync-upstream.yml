@@ -1,0 +1,198 @@
+name: Sync upstream mirror
+
+# ONE-WAY ONLY: mahimailabs/voice-prices → parlot-ai/voice-prices.
+# Never push, force-push, open a PR, or otherwise write to mahimailabs.
+# Local-only commits on this mirror (this workflow) stay on parlot-ai; they are
+# rebased onto upstream when mahimailabs moves, then pushed to origin only.
+# Monday 12:00 UTC runs before platform refresh-voice-prices (14:00 UTC).
+# Daily lag check fails when upstream/main is not an ancestor of mirror main.
+on:
+  schedule:
+    - cron: "0 12 * * 1"
+    - cron: "30 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: mahimailabs/voice-prices
+  MIRROR_REPO: parlot-ai/voice-prices
+  UPSTREAM_URL: https://github.com/mahimailabs/voice-prices.git
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          # Token can write only this repo (parlot-ai/voice-prices). It cannot
+          # authenticate pushes to mahimailabs even if a push URL were set.
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch mahimailabs (read-only remote)
+        run: |
+          set -euo pipefail
+          # Refuse to run if this workflow was somehow checked out elsewhere.
+          case "${GITHUB_REPOSITORY}" in
+            "${MIRROR_REPO}") ;;
+            *)
+              echo "::error::Refusing to run outside ${MIRROR_REPO} (got ${GITHUB_REPOSITORY})."
+              exit 1
+              ;;
+          esac
+
+          git remote add upstream "${UPSTREAM_URL}"
+          # Hard-disable any push to mahimailabs (fetch-only).
+          git remote set-url --push upstream DISABLED
+          git fetch --no-tags upstream main
+
+          origin_url=$(git remote get-url origin)
+          upstream_fetch=$(git remote get-url upstream)
+          upstream_push=$(git remote get-url --push upstream)
+          echo "origin:         ${origin_url}"
+          echo "upstream fetch: ${upstream_fetch}"
+          echo "upstream push:  ${upstream_push}"
+
+          case "${origin_url}" in
+            *"${MIRROR_REPO}"*) ;;
+            *)
+              echo "::error::origin must be ${MIRROR_REPO}; refusing to sync."
+              exit 1
+              ;;
+          esac
+          case "${upstream_fetch}" in
+            *"${UPSTREAM_REPO}"*) ;;
+            *)
+              echo "::error::upstream fetch must be ${UPSTREAM_REPO}; refusing to sync."
+              exit 1
+              ;;
+          esac
+          if [ "${upstream_push}" != "DISABLED" ]; then
+            echo "::error::upstream push URL must be DISABLED; refusing to sync."
+            exit 1
+          fi
+
+          echo "mirror=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "upstream=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
+
+      - name: Report lag before sync
+        run: |
+          echo "Mirror HEAD:   $mirror"
+          echo "Upstream HEAD: $upstream"
+          if [ "$mirror" = "$upstream" ]; then
+            echo "status=equal" >> "$GITHUB_ENV"
+            echo "Mirror SHA matches mahimailabs/voice-prices main."
+          elif git merge-base --is-ancestor upstream/main HEAD; then
+            echo "status=ahead" >> "$GITHUB_ENV"
+            local_only=$(git rev-list --count upstream/main..HEAD)
+            echo "Mirror has all upstream commits plus $local_only local-only commit(s) (not pushed upstream)."
+          elif git merge-base --is-ancestor HEAD upstream/main; then
+            echo "status=behind" >> "$GITHUB_ENV"
+            ahead=$(git rev-list --count HEAD..upstream/main)
+            echo "Mirror is behind by $ahead commit(s) (fast-forward possible)."
+          else
+            echo "status=diverged" >> "$GITHUB_ENV"
+            echo "Mirror diverged from mahimailabs (local commits + new upstream); rebase onto upstream, push origin only."
+          fi
+
+      - name: Sync from mahimailabs onto this mirror only
+        id: sync
+        if: >
+          (github.event_name == 'workflow_dispatch' ||
+           (github.event_name == 'schedule' && github.event.schedule == '0 12 * * 1')) &&
+          (env.status == 'behind' || env.status == 'diverged')
+        run: |
+          set -euo pipefail
+          # Guard: the only allowed write remote is origin (parlot-ai).
+          origin_push=$(git remote get-url --push origin)
+          case "${origin_push}" in
+            *"${MIRROR_REPO}"*) ;;
+            *)
+              echo "::error::Refusing push: origin is not ${MIRROR_REPO} (${origin_push})."
+              exit 1
+              ;;
+          esac
+          if [ "$(git remote get-url --push upstream)" != "DISABLED" ]; then
+            echo "::error::Refusing sync: upstream push is not DISABLED."
+            exit 1
+          fi
+
+          if [ "$status" = "behind" ]; then
+            git merge --ff-only upstream/main
+            git push origin HEAD:main
+          else
+            # Replay mirror-only commits (e.g. this workflow) onto upstream/main.
+            # Result stays on parlot-ai; never pushed to mahimailabs.
+            if ! git rebase upstream/main; then
+              git rebase --abort || true
+              echo "rebase_failed=true" >> "$GITHUB_ENV"
+              exit 1
+            fi
+            git push --force-with-lease origin HEAD:main
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "Synced mirror to $(git rev-parse HEAD) (origin=${MIRROR_REPO} only)"
+
+      - name: Open issue when sync cannot rebase
+        if: failure() && env.rebase_failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            printf 'Automated **one-way** mirror sync could not rebase `main` onto '
+            printf '[mahimailabs/voice-prices](https://github.com/mahimailabs/voice-prices).\n\n'
+            printf 'Direction is only mahimailabs → parlot-ai. Do **not** open a PR or push to mahimailabs.\n\n'
+            printf 'Mirror: `%s`\nUpstream: `%s`\n\n' "$mirror" "$upstream"
+            printf 'Resolve conflicts on **parlot-ai/voice-prices**, keep mirror-only files '
+            printf '(this workflow), rebase onto upstream, then '
+            printf '`git push --force-with-lease origin main`.\n\n'
+            printf 'Run: %s\n' "$RUN_URL"
+          } > body.md
+
+          gh label create mirror-sync \
+            --color d93f0b \
+            --description 'parlot-ai/voice-prices cannot sync from mahimailabs' \
+            2>/dev/null || true
+
+          existing=$(gh issue list --repo "$MIRROR_REPO" --label mirror-sync --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$MIRROR_REPO" --body-file body.md
+          else
+            gh issue create \
+              --repo "$MIRROR_REPO" \
+              --title 'Mirror sync blocked: rebase onto mahimailabs/voice-prices failed' \
+              --label mirror-sync \
+              --body-file body.md
+          fi
+
+      - name: Lag check (fail if missing upstream commits)
+        if: always() && env.rebase_failed != 'true'
+        run: |
+          git fetch --no-tags upstream main
+          mirror_now=$(git rev-parse HEAD)
+          upstream_now=$(git rev-parse upstream/main)
+          echo "Mirror HEAD:   $mirror_now"
+          echo "Upstream HEAD: $upstream_now"
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "OK: mirror contains mahimailabs/voice-prices main (one-way; local-only commits stay on parlot-ai)."
+            exit 0
+          fi
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            ahead=$(git rev-list --count HEAD..upstream/main)
+            echo "::error::Mirror is behind mahimailabs/voice-prices by $ahead commit(s)."
+            exit 1
+          fi
+          echo "::error::Mirror has diverged from mahimailabs/voice-prices."
+          exit 1
