@@ -197,6 +197,30 @@ def test_output_headline_disagreeing_with_tiers_is_refused():
     assert reason is not None and reason.startswith('output headline rate')
 
 
+def test_a_flat_zero_output_rate_is_refused_rather_than_crashing():
+    # The real shape of Telnyx's decision-flash and decision-pro rows.
+    model, reason = convert_row(_row(output_rate='0.00'))
+    assert model is None
+    assert reason is not None and reason.startswith('output rate is a flat zero')
+
+
+def test_a_flat_zero_input_rate_is_refused_rather_than_crashing():
+    model, reason = convert_row(_row(input_rate='0.00'))
+    assert model is None
+    assert reason is not None and reason.startswith('input rate is a flat zero')
+
+
+def test_only_the_standard_service_tier_is_imported():
+    # Telnyx publishes flex/standard/priority rows under one model id; importing all of them would
+    # add the same id several times at different prices.
+    standard, reason = convert_row(_row(service_tier='standard'))
+    assert reason is None and standard is not None
+
+    model, reason = convert_row(_row(service_tier='priority'))
+    assert model is None
+    assert reason is not None and "'priority'" in reason
+
+
 def test_an_unknown_unit_is_refused_rather_than_assumed():
     model, reason = convert_row(_row(unit='per_minute'))
     assert model is None
