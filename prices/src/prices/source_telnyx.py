@@ -52,6 +52,10 @@ PRICING_SOURCE_URL = f'{PRICING_API}/products/{INFERENCE_SLUG}'
 SUPPORTED_UNIT = 'per_1k_tokens'
 SUPPORTED_CURRENCY = 'USD'
 
+#: Some models are published once per service tier under the same id. The catalog holds one price per
+#: id, so only this tier is imported; a row with no tier predates the field and is taken as standard.
+SUPPORTED_SERVICE_TIER = 'standard'
+
 #: Rates arrive per 1,000 tokens; the catalog stores dollars per 1,000,000.
 PER_1K_TO_MTOK = 1000
 
@@ -79,6 +83,7 @@ class InferenceRow(BaseModel):
     model_config = ConfigDict(extra='allow', populate_by_name=True)
 
     model_id: str = Field(alias='model')
+    service_tier: str | None = None
     input_rate: Decimal
     output_rate: Decimal
     cached_input_rate: Decimal | None = None
@@ -265,6 +270,8 @@ def flat_rate(headline: Decimal, tiers: list[Tier]) -> Decimal | None:
 
 def convert_row(row: InferenceRow) -> tuple[ModelInfo | None, str | None]:
     """Convert one API row into a catalog model, or explain why it cannot be converted."""
+    if row.service_tier not in (None, SUPPORTED_SERVICE_TIER):
+        return None, f'service tier is {row.service_tier!r}, only {SUPPORTED_SERVICE_TIER!r} is imported'
     if row.unit != SUPPORTED_UNIT:
         return None, f'unit is {row.unit!r}, expected {SUPPORTED_UNIT!r}'
     if row.currency != SUPPORTED_CURRENCY:
@@ -281,6 +288,11 @@ def convert_row(row: InferenceRow) -> tuple[ModelInfo | None, str | None]:
             f'{dimension} headline rate {headline} disagrees with its tiers ({", ".join(rates)}); '
             'the API does not document what the tier bounds measure'
         )
+    # A flat zero is as ambiguous here as on the cached dimension (free, or not billed on this
+    # dimension at all), and ModelPrice requires both rates to be positive.
+    if input_rate <= 0 or output_rate <= 0:
+        dimension = 'input' if input_rate <= 0 else 'output'
+        return None, f'{dimension} rate is a flat zero; the API does not say whether that means free or unbilled'
 
     prices = ModelPrice(
         input_mtok=input_rate * PER_1K_TO_MTOK,
